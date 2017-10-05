@@ -14,12 +14,13 @@ INPUT_DIR=$1
 OUTPUT_DIR=$2
 MAX_EPSILON=$3
 
+# --whitebox_train="1,2,3,4,6,7,8,9" \
 python attack.py \
   --input_dir="${INPUT_DIR}" \
   --output_dir="${OUTPUT_DIR}" \
   --max_epsilon="${MAX_EPSILON}" \
-  --blackbox_train="10" \
-  --whitebox_train="1,2,3,4,6,7,8,9" \
+  --blackbox_train="10" \#not used
+  --whitebox_train="1,2,4,7" \#InceptionV3, InceptionV4, ResNetV2, AdvInceptionV3 
   --test="" \
-  --iternum=8 \
+  --iternum=25 \
   --checkpoint_path=model_ckpts

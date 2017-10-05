@@ -6,6 +6,7 @@ from __future__ import print_function
 
 import os, sys
 import numpy as np
+import models
 import csv
 import pandas as pd
 from PIL import Image
@@ -49,9 +50,6 @@ tf.flags.DEFINE_float(
     'margin', 0.01, 'margin parameter in the loss function.')
 
 tf.flags.DEFINE_string(
-    'blackbox_train', '0,1,2,3,4,10', 'models for blackbox training.')
-
-tf.flags.DEFINE_string(
     'whitebox_train', '5,6,7,8,9', 'models for whitebox training.')
 
 tf.flags.DEFINE_string(
@@ -61,15 +59,6 @@ FLAGS = tf.flags.FLAGS
 
 def string_to_list(s):
     return [int(x) for x in filter(None, s.split(','))]
-
-def compress_by_jpeg(images):
-    jpeg_images = np.zeros(images.shape)
-    for i in range(images.shape[0]):
-        buffer = StringIO.StringIO()
-        raw = (((images[i, :, :, :] + 1.0) * 0.5) * 255.0).astype(np.uint8)
-        Image.fromarray(raw).save(buffer, "JPEG", quality=15)
-        jpeg_images[i,:,:,:] = np.array(Image.open(buffer).convert('RGB')).astype(np.float) / 255.0
-    return jpeg_images
 
 def load_target_class(input_dir):
     """Loads target classes."""
@@ -90,11 +79,6 @@ def load_images(input_dir, batch_shape):
             # original images
             image = np.array(Image.open(f).convert('RGB')).astype(np.float) / 255.0
 
-            # JPEG images
-            #buffer = StringIO.StringIO()
-            #Image.open(f).save(buffer, "JPEG", quality=15)
-            #jpeg_image = np.array(Image.open(buffer).convert('RGB')).astype(np.float) / 255.0
-
         # Images for inception classifier are normalized to be in [-1, 1] interval.
         images[idx, :, :, :] = image * 2.0 - 1.0
         filenames.append(os.path.basename(filepath))
@@ -114,7 +98,6 @@ def load_images(input_dir, batch_shape):
     if idx > 0:
         yield filenames, images, target_class_batch
 
-
 def save_images(images, filenames, output_dir):
     for i, filename in enumerate(filenames):
         # Images for inception classifier are normalized to be in [-1, 1] interval,
@@ -122,7 +105,6 @@ def save_images(images, filenames, output_dir):
         with tf.gfile.Open(os.path.join(output_dir, filename), 'w') as f:
             img = (((images[i, :, :, :] + 1.0) * 0.5) * 255.0).astype(np.uint8)
             Image.fromarray(img).save(f, format='PNG')
-
 
 class Evaluator(object):
     def __init__(self, name, models, image, image_input, true_label, test):
@@ -150,8 +132,7 @@ class Evaluator(object):
             print('%s overall evaluation errors: %s' % (self.name, self.overall_errors / self.processed_batch_num))
 
 class Attacker(object):
-    def __init__(self, name, models, image_input, image, true_label, max_epsilon, k, train, test,
-                 optimizer, loss_type, margin, learning_rate):
+    def __init__(self, name, models, image_input, image, true_label, max_epsilon, k, train, test, margin, learning_rate):
         self.name = name
         self.models = models
         self.max_epsilon = max_epsilon
@@ -159,8 +140,6 @@ class Attacker(object):
         self.processed_batch_num = 0
         self.overall_train_errors = np.zeros(len(train))
         self.overall_test_errors = np.zeros(len(test))
-        self.optimizer = optimizer
-        self.loss_type = loss_type
 
         # placeholders
         self.label = true_label
@@ -182,43 +161,18 @@ class Attacker(object):
         self.train_errors = define_errors(train)
         self.test_errors = define_errors(test)
 
-        # define average loss
-        self.average_loss = 0
-        for i in train:
-            self.average_loss += tf.reduce_mean(
-                tf.nn.sparse_softmax_cross_entropy_with_logits(logits=models[i].logits, labels=true_label)) / len(train)
-
         # define mixture loss
         softmax_prob_sum = 0
         for i in train:
             softmax_prob_sum += tf.reduce_sum(tf.nn.softmax(models[i].logits) * label_mask, axis=1)
         self.mixture_loss = (-1.0) * tf.reduce_mean(tf.log(margin + softmax_prob_sum))
-
-        # define hinge loss
-        hinge_losses = []
-        for i in train:
-            label_logits = tf.reduce_sum(models[i].logits * label_mask, axis=1)
-            max_logits = tf.reduce_max(models[i].logits - label_mask * 100, axis=1)
-            hinge_losses.append(label_logits - max_logits)
-        self.hinge_loss = tf.reduce_mean(tf.reduce_max(tf.stack(hinge_losses, axis=0), axis=0))
-
+        
         # define gradient
-        grad = None
-        if loss_type == 'average':
-            grad = tf.gradients(self.average_loss, image)[0]
-        if loss_type == 'mixture':
-            grad = tf.gradients(self.mixture_loss, image)[0]
-        if loss_type == 'hinge':
-            grad = tf.gradients(self.hinge_loss, image)[0]
-
+        grad = tf.gradients(self.mixture_loss, image)[0]
+        
         # define optimization step
-        opt = None
-        if optimizer == 'sgd':
-            opt = tf.train.GradientDescentOptimizer(learning_rate=learning_rate * max_epsilon)
-            self.all_model_gradient_step = opt.apply_gradients([(tf.sign(grad), image)])
-        if optimizer == 'rmsprop':
-            opt = tf.train.RMSPropOptimizer(learning_rate=learning_rate * max_epsilon, epsilon=1e-9, decay=0.9)
-            self.all_model_gradient_step = opt.apply_gradients([(grad, image)])
+        opt = tf.train.GradientDescentOptimizer(learning_rate=learning_rate * max_epsilon)
+        self.all_model_gradient_step = opt.apply_gradients([(tf.sign(grad), image)])
         self.apply_null = opt.apply_gradients([(tf.zeros(image.get_shape().as_list(), dtype=tf.float32), image)])
 
         # define clipping step
@@ -232,9 +186,6 @@ class Attacker(object):
             y = sess.run(self.models[0].preds)
 
         start = timer()
-        if self.optimizer == 'rmsprop':
-            for _ in range(200):
-                sess.run(self.apply_null)
         for i in range(self.k):
             sess.run(self.all_model_gradient_step, feed_dict={self.label: y, self.image_input: x_batch})
             sess.run(self.clipping_step, feed_dict={self.image_input: x_batch})
@@ -268,10 +219,8 @@ def main(_):
         # Prepare graph
         image_input = tf.placeholder(tf.float32, shape=batch_shape)
         image = tf.get_variable('adversarial_image', shape=batch_shape)
-        label = tf.placeholder(tf.int32, shape=[FLAGS.batch_size])
+        label = tf.placeholder(tf.int32, shape=FLAGS.batch_size)
         sess = tf.Session()
-
-        import models
 
         initialized_vars = set()
         savers = []
@@ -285,11 +234,10 @@ def main(_):
                       models.Ens4AdvInceptionV3Model, models.KerasXceptionModel]
         # model 11
         all_models += [models.SmoothInceptionResNetV2Model]
-        blackbox_train = string_to_list(FLAGS.blackbox_train)
         whitebox_train = string_to_list(FLAGS.whitebox_train)
         test = string_to_list(FLAGS.test)
         indices_to_load = [index for index in range(len(all_models)) if
-                           index in blackbox_train + whitebox_train + test]
+                           index in whitebox_train + test]
 
         # build all the models and specify the saver
         for i, model in enumerate(all_models):
@@ -306,30 +254,13 @@ def main(_):
                 savers.append(tf.train.Saver(saver_dict))
                 initialized_vars = set(all_vars)
 
-        #whitebox_ratio = max(2.0 / FLAGS.max_epsilon, 0.2)
-        #blackbox_ratio = 1 - whitebox_ratio
         whitebox_ratio = 1.0
-        blackbox_ratio = 0.0
         with tf.variable_scope('whitebox-attacker'):
-            with tf.variable_scope('blackbox-attacker'):
-                blackbox_attacker = Attacker(name='blackbox-attacker', models=all_models, image_input=image_input,
-                                             image=image, true_label=label,
-                                             max_epsilon=eps * blackbox_ratio, k=FLAGS.iternum, train=blackbox_train,
-                                             test=[], optimizer='rmsprop',
-                                             loss_type='mixture', margin=FLAGS.margin,
-                                             learning_rate=FLAGS.learning_rate)
-
-            whitebox_attacker = Attacker(name='whitebox-attacker', models=all_models, image_input=image_input,
-                                         image=image, true_label=label,
-                                         max_epsilon=eps * whitebox_ratio, k=FLAGS.iternum, train=whitebox_train,
-                                         test=[], optimizer='sgd',
-                                         loss_type='mixture', margin=FLAGS.margin, learning_rate=FLAGS.learning_rate)
+            whitebox_attacker = Attacker(name='whitebox-attacker', models=all_models, image_input=image_input, image=image, true_label=label, max_epsilon=eps * whitebox_ratio, k=FLAGS.iternum, train=whitebox_train, test=[], margin=FLAGS.margin, learning_rate=FLAGS.learning_rate)
 
         with tf.variable_scope('raw_evaluator'):
             original_eval = Evaluator(name='original', models=all_models, image_input=image_input, image=image, true_label=label, test=test)
-        with tf.variable_scope('jpeg_evaluator'):
-            jpeg_eval = Evaluator(name='jpeg', models=all_models, image_input=image_input, image=image, true_label=label, test=test)
-
+       
         # Run computation
         tot_time = 0.0
         processed = 0.0
@@ -344,16 +275,11 @@ def main(_):
 
         for filenames, images, target_classes in load_images(FLAGS.input_dir, batch_shape):
             start = timer()
-            print('batch %d' % (blackbox_attacker.processed_batch_num + 1))
-            y, blackbox_perturb = blackbox_attacker.run(sess, images, target_classes)
-            if whitebox_ratio > 0:
-                _, whitebox_perturb = whitebox_attacker.run(sess, images + blackbox_perturb, target_classes)
-            else:
-                whitebox_perturb = 0
-            images += blackbox_perturb + whitebox_perturb
+            
+            _, whitebox_perturb = whitebox_attacker.run(sess, images, target_classes)
+            images += whitebox_perturb
             original_eval.run(sess, images, target_classes)
-            jpeg_eval.run(sess, compress_by_jpeg(images), target_classes)
-
+            
             if FLAGS.output_dir != '':
                 save_images(images, filenames, FLAGS.output_dir)
 
